@@ -1,0 +1,961 @@
+import { useState, useRef, useCallback } from "react";
+
+// ─── THEME ──────────────────────────────────────────────────────────────────
+const G = `
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Barlow:wght@300;400;500;600&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#060a0f;--ink2:#0d1219;--ink3:#131c27;--ink4:#1a2535;
+  --wire:#1f2d3d;--wire2:#263447;
+  --gold:#d4a843;--gold2:#f0c76a;--gold3:#b8922e;
+  --lime:#39d353;--lime2:#1a6b2a;
+  --red:#e53935;--red2:#7f1d1d;
+  --sky:#38bdf8;--sky2:#0c4a6e;
+  --text:#dde6f0;--text2:#8fa3bb;--text3:#4d6480;
+  --font-head:'Barlow Condensed',sans-serif;
+  --font-mono:'JetBrains Mono',monospace;
+  --font-body:'Barlow',sans-serif;
+}
+html,body,#root{background:var(--ink);color:var(--text);font-family:var(--font-body);min-height:100vh}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--ink2)}
+::-webkit-scrollbar-thumb{background:var(--wire2)}
+button{cursor:pointer;font-family:var(--font-body)}
+input,textarea,select{font-family:var(--font-body)}
+`;
+
+// ─── HELPERS ────────────────────────────────────────────────────────────────
+const API = "https://api.anthropic.com/v1/messages";
+const MODEL = "claude-sonnet-4-20250514";
+
+async function callAI(systemPrompt, userContent, useSearch = false, imageBase64 = null, imageMime = null) {
+  let contentArr;
+  if (imageBase64) {
+    contentArr = [
+      { type: "image", source: { type: "base64", media_type: imageMime || "image/jpeg", data: imageBase64 } },
+      { type: "text", text: userContent },
+    ];
+  } else {
+    contentArr = userContent;
+  }
+
+  const body = {
+    model: MODEL,
+    max_tokens: 1000,
+    system: systemPrompt,
+    messages: [{ role: "user", content: contentArr }],
+    ...(useSearch ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}),
+  };
+
+  const res = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content.filter(b => b.type === "text").map(b => b.text).join("");
+}
+
+function parseJSON(raw) {
+  const clean = raw.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("[");
+  const end = clean.lastIndexOf("]");
+  if (start === -1) {
+    const os = clean.indexOf("{");
+    const oe = clean.lastIndexOf("}");
+    if (os !== -1) return [JSON.parse(clean.slice(os, oe + 1))];
+    throw new Error("No JSON found");
+  }
+  return JSON.parse(clean.slice(start, end + 1));
+}
+
+function toBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+const TOLERANCE_LABELS = { 1: "Very Conservative", 2: "Conservative", 3: "Moderate", 4: "Aggressive", 5: "High Risk" };
+const SPORTS = ["All Sports", "Football/Soccer", "Rugby", "Cricket", "Tennis", "Basketball", "American Football"];
+const LEAGUES = ["All Leagues", "PSL", "Premier League", "Champions League", "La Liga", "Serie A", "Bundesliga", "MLS"];
+
+// ─── SYSTEMS ────────────────────────────────────────────────────────────────
+const SCOUT_SYSTEM = `You are an expert sports betting analyst. Search the web for today's betting predictions. Return ONLY a JSON array of picks with odds ≤ 2.5. Each object must have:
+{
+  "id": "unique string",
+  "match": "Team A vs Team B",
+  "league": "league name",
+  "sport": "sport name",
+  "pick": "exact bet (e.g. 'Team A to Win', 'Over 2.5 Goals', 'Both Teams to Score')",
+  "odds": 1.85,
+  "kickoff": "HH:MM or 'Today 20:00'",
+  "tipsters": 3,
+  "confidence": "high|medium|low",
+  "sources": ["source1", "source2"],
+  "brief": "one-line reason"
+}
+Return ONLY valid JSON array. No markdown. Aim for 6-10 diverse picks across different matches.`;
+
+const RESEARCH_SYSTEM = `You are a sports intelligence analyst. Search the web and compile a deep research report on this match. Return ONLY JSON with these fields:
+{
+  "h2h": [{"date":"DD Mon YYYY","result":"Team A 2-1 Team B","competition":"name"}],
+  "form_home": ["W","W","L","D","W"],
+  "form_away": ["L","W","W","L","D"],
+  "home_goals_avg": 1.8,
+  "away_goals_avg": 1.2,
+  "player_news": [{"player":"Name","team":"Team","news":"injury/form update","impact":"high|medium|low"}],
+  "coach_news": [{"coach":"Name","team":"Team","news":"press conference quote or tactical note"}],
+  "match_facts": ["interesting stat 1","interesting stat 2","interesting stat 3"],
+  "weather": "conditions if outdoor sport",
+  "venue": "stadium name",
+  "referee": "name if known",
+  "prediction_consensus": "brief consensus from tipsters found online",
+  "risk_factors": ["risk 1","risk 2"],
+  "why_picked": "3-4 sentence detailed justification for this specific pick"
+}
+Return ONLY valid JSON. No markdown.`;
+
+const IMAGE_SYSTEM = `You are a betting prediction extractor. Analyse this image (screenshot from social media, WhatsApp, or tipster page). Extract ALL betting predictions visible. Return ONLY a JSON array:
+[{
+  "match": "Team A vs Team B",
+  "league": "league or competition",
+  "sport": "sport",
+  "pick": "exact bet",
+  "odds": 1.85 or null,
+  "amount": 1000 or null,
+  "tipster": "username or handle if visible",
+  "source": "WhatsApp|Twitter|Facebook|Website|Unknown",
+  "confidence": "high|medium|low",
+  "brief": "what the tipster said"
+}]
+Return ONLY valid JSON array. No markdown.`;
+
+// ─── COMPONENTS ─────────────────────────────────────────────────────────────
+function Spinner({ size = 16 }) {
+  return (
+    <div style={{
+      width: size, height: size, border: `2px solid var(--wire2)`,
+      borderTopColor: "var(--gold)", borderRadius: "50%",
+      animation: "spin 0.7s linear infinite", flexShrink: 0,
+    }} />
+  );
+}
+
+function FormDot({ result }) {
+  const colors = { W: "#39d353", D: "#d4a843", L: "#e53935" };
+  return (
+    <div style={{
+      width: 22, height: 22, borderRadius: "50%", background: colors[result] || "#333",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontSize: 10, fontWeight: 700, color: "#000", fontFamily: "var(--font-mono)",
+    }}>{result}</div>
+  );
+}
+
+function ImpactBadge({ impact }) {
+  const map = { high: ["#e53935", "#7f1d1d"], medium: ["#d4a843", "#3d2e0a"], low: ["#4d6480", "#131c27"] };
+  const [fg, bg] = map[impact] || map.low;
+  return (
+    <span style={{ background: bg, color: fg, border: `1px solid ${fg}`, fontSize: 9, padding: "2px 6px", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: 1 }}>
+      {impact}
+    </span>
+  );
+}
+
+function ConfidenceMeter({ level }) {
+  const map = { high: 3, medium: 2, low: 1 };
+  const n = map[level] || 1;
+  const colors = { high: "var(--lime)", medium: "var(--gold)", low: "var(--red)" };
+  return (
+    <div style={{ display: "flex", gap: 3 }}>
+      {[1, 2, 3].map(i => (
+        <div key={i} style={{ width: 8, height: 8, background: i <= n ? colors[level] : "var(--wire)", borderRadius: 2 }} />
+      ))}
+    </div>
+  );
+}
+
+// ─── MODAL: deep research card ────────────────────────────────────────────
+function ResearchModal({ pick, onClose }) {
+  const [research, setResearch] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState("Searching match history...");
+  const [error, setError] = useState("");
+
+  const steps = [
+    "Searching match history...",
+    "Fetching player & injury news...",
+    "Reading coach press conferences...",
+    "Analysing recent form...",
+    "Compiling intelligence report...",
+  ];
+
+  const runResearch = useCallback(async () => {
+    setLoading(true);
+    try {
+      let si = 0;
+      const interval = setInterval(() => {
+        si = (si + 1) % steps.length;
+        setStatus(steps[si]);
+      }, 2000);
+
+      const raw = await callAI(
+        RESEARCH_SYSTEM,
+        `Research this bet for today: ${pick.match} | Pick: ${pick.pick} | League: ${pick.league} | Sport: ${pick.sport}. Search the web for latest news, H2H records, form, injuries, and any relevant match information.`,
+        true
+      );
+      clearInterval(interval);
+      const data = parseJSON(raw);
+      setResearch(Array.isArray(data) ? data[0] : data);
+    } catch (e) {
+      setError("Could not load research. Check connection.");
+    }
+    setLoading(false);
+  }, [pick]);
+
+  useState(() => { runResearch(); }, []);
+
+  // trigger on mount
+  useCallback(() => { runResearch(); }, [])();
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(6,10,15,0.95)", zIndex: 1000,
+      display: "flex", alignItems: "flex-start", justifyContent: "center",
+      padding: "16px", overflowY: "auto",
+    }} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{
+        background: "var(--ink2)", border: "1px solid var(--wire2)", width: "100%", maxWidth: 720,
+        marginTop: 16, marginBottom: 16, position: "relative",
+      }}>
+        {/* Header */}
+        <div style={{ background: "var(--ink3)", borderBottom: "1px solid var(--wire2)", padding: "16px 20px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 22, letterSpacing: 1, color: "var(--gold)", lineHeight: 1 }}>
+                {pick.match}
+              </div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 4 }}>
+                {pick.league} · {pick.sport} · {pick.kickoff}
+              </div>
+            </div>
+            <button onClick={onClose} style={{
+              background: "none", border: "1px solid var(--wire2)", color: "var(--text3)",
+              padding: "4px 10px", fontSize: 18, lineHeight: 1,
+            }}>✕</button>
+          </div>
+          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ background: "var(--ink4)", border: "1px solid var(--gold3)", padding: "6px 14px" }}>
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)" }}>PICK </span>
+              <span style={{ fontFamily: "var(--font-head)", fontSize: 18, color: "var(--text)", letterSpacing: 1 }}>{pick.pick}</span>
+            </div>
+            <div style={{ background: "var(--lime2)", border: "1px solid var(--lime)", padding: "6px 14px" }}>
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)" }}>ODDS </span>
+              <span style={{ fontFamily: "var(--font-head)", fontSize: 22, color: "var(--lime)", letterSpacing: 1 }}>{pick.odds}</span>
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <ConfidenceMeter level={pick.confidence} />
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", textTransform: "uppercase" }}>{pick.confidence}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div style={{ padding: "20px" }}>
+          {loading && (
+            <div style={{ textAlign: "center", padding: "48px 20px" }}>
+              <Spinner size={32} />
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--gold)", marginTop: 16 }}>{status}</div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 6 }}>Scanning live sources...</div>
+            </div>
+          )}
+
+          {error && (
+            <div style={{ background: "var(--red2)", border: "1px solid var(--red)", padding: 14, color: "#fca5a5", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+              ⚠ {error}
+              <button onClick={runResearch} style={{ marginLeft: 12, background: "none", border: "1px solid var(--red)", color: "var(--red)", padding: "3px 10px", fontSize: 11 }}>Retry</button>
+            </div>
+          )}
+
+          {research && !loading && (<>
+            {/* Why Picked */}
+            <Section title="🎯 Why This Pick">
+              <p style={{ fontSize: 14, lineHeight: 1.7, color: "var(--text2)" }}>{research.why_picked}</p>
+            </Section>
+
+            {/* Form */}
+            <Section title="📊 Recent Form">
+              <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                {["home", "away"].map(side => {
+                  const [teamA, , teamB] = pick.match.split(" ");
+                  const label = side === "home" ? teamA : teamB;
+                  const form = side === "home" ? research.form_home : research.form_away;
+                  return (
+                    <div key={side}>
+                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>
+                        {label || (side === "home" ? "Home" : "Away")}
+                      </div>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {(form || []).map((r, i) => <FormDot key={i} result={r} />)}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div style={{ display: "flex", gap: 20 }}>
+                  <Stat label="Home Goals/Game" value={research.home_goals_avg} />
+                  <Stat label="Away Goals/Game" value={research.away_goals_avg} />
+                </div>
+              </div>
+            </Section>
+
+            {/* H2H */}
+            {research.h2h?.length > 0 && (
+              <Section title="⚔️ Head to Head">
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {research.h2h.slice(0, 5).map((r, i) => (
+                    <div key={i} style={{ display: "flex", gap: 12, alignItems: "center", padding: "8px 12px", background: "var(--ink3)", borderLeft: "2px solid var(--wire2)" }}>
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", minWidth: 80 }}>{r.date}</span>
+                      <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{r.result}</span>
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)" }}>{r.competition}</span>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* Player News */}
+            {research.player_news?.length > 0 && (
+              <Section title="👤 Player News & Injuries">
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {research.player_news.map((p, i) => (
+                    <div key={i} style={{ padding: "10px 14px", background: "var(--ink3)", display: "flex", gap: 12, alignItems: "flex-start" }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 3 }}>
+                          <span style={{ fontWeight: 600, fontSize: 13 }}>{p.player}</span>
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)" }}>{p.team}</span>
+                        </div>
+                        <div style={{ fontSize: 13, color: "var(--text2)", lineHeight: 1.5 }}>{p.news}</div>
+                      </div>
+                      <ImpactBadge impact={p.impact} />
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* Coach News */}
+            {research.coach_news?.length > 0 && (
+              <Section title="🧠 Coach & Tactical Notes">
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {research.coach_news.map((c, i) => (
+                    <div key={i} style={{ padding: "10px 14px", background: "var(--ink3)", borderLeft: "2px solid var(--gold3)" }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 3 }}>{c.coach} <span style={{ color: "var(--text3)", fontWeight: 400 }}>({c.team})</span></div>
+                      <div style={{ fontSize: 13, color: "var(--text2)", fontStyle: "italic", lineHeight: 1.5 }}>"{c.news}"</div>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* Match Facts */}
+            {research.match_facts?.length > 0 && (
+              <Section title="📌 Key Match Facts">
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {research.match_facts.map((f, i) => (
+                    <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 0", borderBottom: "1px solid var(--wire)" }}>
+                      <span style={{ color: "var(--gold)", fontSize: 12 }}>◆</span>
+                      <span style={{ fontSize: 13, color: "var(--text2)", lineHeight: 1.5 }}>{f}</span>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* Logistics */}
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 16 }}>
+              {research.venue && <Chip icon="🏟" label="Venue" value={research.venue} />}
+              {research.weather && <Chip icon="🌤" label="Weather" value={research.weather} />}
+              {research.referee && <Chip icon="🟨" label="Referee" value={research.referee} />}
+            </div>
+
+            {/* Risk Factors */}
+            {research.risk_factors?.length > 0 && (
+              <Section title="⚠ Risk Factors">
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {research.risk_factors.map((r, i) => (
+                    <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13, color: "#fca5a5" }}>
+                      <span>•</span>{r}
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* Sources */}
+            {research.prediction_consensus && (
+              <Section title="🌐 Tipster Consensus">
+                <p style={{ fontSize: 13, color: "var(--text2)", lineHeight: 1.6 }}>{research.prediction_consensus}</p>
+              </Section>
+            )}
+          </>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontFamily: "var(--font-head)", fontSize: 14, letterSpacing: 1, color: "var(--text3)", textTransform: "uppercase", marginBottom: 10, paddingBottom: 6, borderBottom: "1px solid var(--wire)" }}>
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div>
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>{label}</div>
+      <div style={{ fontFamily: "var(--font-head)", fontSize: 24, color: "var(--gold)", letterSpacing: 1 }}>{value}</div>
+    </div>
+  );
+}
+
+function Chip({ icon, label, value }) {
+  return (
+    <div style={{ background: "var(--ink3)", border: "1px solid var(--wire2)", padding: "8px 12px" }}>
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>{icon} {label}</div>
+      <div style={{ fontSize: 13, marginTop: 2 }}>{value}</div>
+    </div>
+  );
+}
+
+// ─── PICK CARD ───────────────────────────────────────────────────────────
+function PickCard({ pick, index, onResearch, onRemove, inSlip }) {
+  const confColors = { high: "var(--lime)", medium: "var(--gold)", low: "var(--text3)" };
+  return (
+    <div
+      style={{
+        background: "var(--ink2)", border: `1px solid ${inSlip ? "var(--gold3)" : "var(--wire2)"}`,
+        padding: "14px 16px", cursor: "pointer", transition: "all 0.2s",
+        animation: `fadeUp 0.3s ease both`, animationDelay: `${index * 0.06}s`,
+        position: "relative",
+      }}
+      onClick={() => onResearch(pick)}
+    >
+      {/* sport tag */}
+      <div style={{ position: "absolute", top: 0, right: 0, background: "var(--ink4)", padding: "3px 8px" }}>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>{pick.sport}</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+        {/* odds pill */}
+        <div style={{
+          background: "var(--ink3)", border: "1px solid var(--wire2)", minWidth: 52, textAlign: "center",
+          padding: "8px 4px", flexShrink: 0,
+        }}>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase" }}>odds</div>
+          <div style={{ fontFamily: "var(--font-head)", fontSize: 26, color: "var(--gold2)", letterSpacing: 1, lineHeight: 1.1 }}>{pick.odds}</div>
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontFamily: "var(--font-head)", fontSize: 16, letterSpacing: 0.5, lineHeight: 1.2, marginBottom: 3 }}>
+            {pick.match}
+          </div>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", marginBottom: 6 }}>
+            {pick.league} · {pick.kickoff}
+          </div>
+          <div style={{ background: "var(--ink3)", display: "inline-block", padding: "4px 10px", fontSize: 12, fontWeight: 600, color: "var(--sky)", marginBottom: 6 }}>
+            {pick.pick}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5 }}>{pick.brief}</div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, flexShrink: 0 }}>
+          <ConfidenceMeter level={pick.confidence} />
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: confColors[pick.confidence], textTransform: "uppercase" }}>{pick.confidence}</div>
+          {pick.tipsters > 0 && (
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)" }}>
+              {pick.tipsters} tipsters
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--sky)", display: "flex", alignItems: "center", gap: 4 }}>
+          <span>▶</span> Click for full intelligence report
+        </div>
+        {onRemove && (
+          <button
+            onClick={e => { e.stopPropagation(); onRemove(pick.id); }}
+            style={{ background: "none", border: "1px solid var(--wire2)", color: "var(--text3)", padding: "3px 8px", fontSize: 11 }}
+          >✕ Remove</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── BET SLIP ─────────────────────────────────────────────────────────────
+function BetSlip({ picks, onResearch, onRemove, stake, onStakeChange }) {
+  if (picks.length === 0) return null;
+  const totalOdds = picks.reduce((acc, p) => acc * p.odds, 1);
+  const payout = stake * totalOdds;
+  const profit = payout - stake;
+
+  return (
+    <div style={{ background: "var(--ink2)", border: "1px solid var(--gold3)", marginTop: 24 }}>
+      <div style={{ background: "var(--ink3)", padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid var(--wire2)" }}>
+        <div style={{ fontFamily: "var(--font-head)", fontSize: 20, letterSpacing: 2, color: "var(--gold)" }}>
+          🎫 ACCUMULATOR SLIP
+        </div>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)" }}>
+          {picks.length} leg{picks.length !== 1 ? "s" : ""}
+        </div>
+      </div>
+
+      <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+        {picks.map((p, i) => (
+          <div key={p.id} style={{ display: "flex", gap: 10, alignItems: "center", cursor: "pointer" }} onClick={() => onResearch(p)}>
+            <div style={{ fontFamily: "var(--font-head)", fontSize: 22, color: "var(--text3)", minWidth: 20 }}>{i + 1}</div>
+            <div style={{ flex: 1, background: "var(--ink3)", padding: "8px 12px" }}>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 14, letterSpacing: 0.5 }}>{p.match}</div>
+              <div style={{ display: "flex", gap: 8, marginTop: 2 }}>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--sky)" }}>{p.pick}</span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)" }}>·</span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)" }}>{p.league}</span>
+              </div>
+            </div>
+            <div style={{ fontFamily: "var(--font-head)", fontSize: 20, color: "var(--gold2)", minWidth: 40, textAlign: "right" }}>
+              {p.odds}
+            </div>
+            <button
+              onClick={e => { e.stopPropagation(); onRemove(p.id); }}
+              style={{ background: "none", border: "none", color: "var(--text3)", fontSize: 16, padding: "4px" }}
+            >✕</button>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding: "12px 16px", borderTop: "1px solid var(--wire2)", background: "var(--ink3)" }}>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 160 }}>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Stake (R)</div>
+            <input
+              type="number"
+              value={stake}
+              onChange={e => onStakeChange(Number(e.target.value))}
+              style={{ background: "var(--ink)", border: "1px solid var(--wire2)", color: "var(--text)", padding: "8px 12px", width: "100%", fontSize: 16, fontFamily: "var(--font-mono)" }}
+            />
+          </div>
+          <div style={{ display: "flex", gap: 16 }}>
+            <div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>Total Odds</div>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 28, color: "var(--gold2)", letterSpacing: 1 }}>{totalOdds.toFixed(2)}</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>Potential Return</div>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 28, color: "var(--lime)", letterSpacing: 1 }}>R{payout.toFixed(0)}</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>Profit</div>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 28, color: "var(--lime)", letterSpacing: 1 }}>R{profit.toFixed(0)}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── UPLOAD PANEL ─────────────────────────────────────────────────────────
+function UploadPanel({ tolerance, onAddPick }) {
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState([]);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const ref = useRef();
+
+  async function analyse() {
+    if (!files.length) return;
+    setLoading(true);
+    setResults([]);
+    setError("");
+    setStatus("Reading your screenshots...");
+    try {
+      const allPicks = [];
+      for (let i = 0; i < files.length; i++) {
+        setStatus(`Analysing image ${i + 1} of ${files.length}...`);
+        const b64 = await toBase64(files[i]);
+        const mime = files[i].type || "image/jpeg";
+        const raw = await callAI(IMAGE_SYSTEM, "Extract all betting predictions from this screenshot.", false, b64, mime);
+        const parsed = parseJSON(raw);
+        allPicks.push(...parsed);
+      }
+      // Filter by tolerance and odds ≤ 2.5
+      const filtered = allPicks.filter(p => p.odds === null || p.odds <= 2.5);
+      setResults(filtered);
+      setStatus(`✅ Extracted ${allPicks.length} picks · ${filtered.length} within odds ≤ 2.5`);
+    } catch (e) {
+      setError("Could not analyse images: " + e.message);
+    }
+    setLoading(false);
+  }
+
+  const handleDrop = useCallback(e => {
+    e.preventDefault();
+    setFiles(Array.from(e.dataTransfer.files).filter(f => f.type.startsWith("image/")));
+  }, []);
+
+  return (
+    <div>
+      <div
+        onDrop={handleDrop}
+        onDragOver={e => e.preventDefault()}
+        onClick={() => ref.current?.click()}
+        style={{
+          border: "2px dashed var(--wire2)", background: "var(--ink2)", padding: "32px 20px",
+          textAlign: "center", cursor: "pointer", transition: "border-color 0.2s", marginBottom: 16,
+        }}
+      >
+        <input ref={ref} type="file" accept="image/*" multiple style={{ display: "none" }}
+          onChange={e => setFiles(Array.from(e.target.files))} />
+        <div style={{ fontSize: 32, marginBottom: 10 }}>📸</div>
+        <div style={{ fontFamily: "var(--font-head)", fontSize: 18, letterSpacing: 1, color: "var(--text2)" }}>
+          Drop screenshots here or click to browse
+        </div>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 6 }}>
+          WhatsApp · Twitter/X · Facebook · Telegram · Any tipster screenshot
+        </div>
+      </div>
+
+      {files.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+          {files.map((f, i) => (
+            <div key={i} style={{ background: "var(--ink3)", border: "1px solid var(--wire2)", padding: "6px 12px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text2)", display: "flex", gap: 8 }}>
+              🖼 {f.name}
+              <button onClick={e => { e.stopPropagation(); setFiles(files.filter((_, j) => j !== i)); }} style={{ background: "none", border: "none", color: "var(--text3)" }}>✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button
+        onClick={analyse}
+        disabled={loading || !files.length}
+        style={{
+          background: loading || !files.length ? "var(--wire2)" : "var(--gold)",
+          color: loading || !files.length ? "var(--text3)" : "#060a0f",
+          border: "none", padding: "12px 24px", fontFamily: "var(--font-head)",
+          fontSize: 16, letterSpacing: 2, marginBottom: 16, width: "100%",
+        }}
+      >
+        {loading ? "ANALYSING..." : "ANALYSE SCREENSHOTS"}
+      </button>
+
+      {loading && (
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 16, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--gold)" }}>
+          <Spinner /> {status}
+        </div>
+      )}
+      {!loading && status && <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--lime)", marginBottom: 16 }}>{status}</div>}
+      {error && <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--red)", marginBottom: 16 }}>⚠ {error}</div>}
+
+      {results.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontFamily: "var(--font-head)", fontSize: 16, letterSpacing: 1, color: "var(--text3)", marginBottom: 4 }}>
+            EXTRACTED PREDICTIONS ({results.length})
+          </div>
+          {results.map((p, i) => (
+            <div key={i} style={{ background: "var(--ink2)", border: "1px solid var(--wire2)", padding: "14px 16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: "var(--font-head)", fontSize: 16, letterSpacing: 0.5 }}>{p.match || "Unknown Match"}</div>
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", margin: "3px 0 6px" }}>
+                    {p.source} · {p.tipster || "Anonymous"} · {p.league || p.sport}
+                  </div>
+                  <div style={{ display: "inline-block", background: "var(--sky2)", padding: "4px 10px", fontSize: 12, color: "var(--sky)", fontWeight: 600, marginBottom: 6 }}>{p.pick}</div>
+                  {p.brief && <div style={{ fontSize: 12, color: "var(--text3)" }}>{p.brief}</div>}
+                </div>
+                <div style={{ textAlign: "right", flexShrink: 0 }}>
+                  <div style={{ fontFamily: "var(--font-head)", fontSize: 26, color: "var(--gold2)" }}>{p.odds || "?"}</div>
+                  {p.amount && <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--lime)" }}>R{p.amount.toLocaleString()}</div>}
+                </div>
+              </div>
+              <button
+                onClick={() => onAddPick({ ...p, id: `img-${i}`, tipsters: 1, kickoff: "TBD", sources: [p.source], confidence: p.confidence || "medium", brief: p.brief || p.pick })}
+                style={{ marginTop: 8, background: "var(--gold)", color: "#060a0f", border: "none", padding: "6px 14px", fontFamily: "var(--font-head)", fontSize: 13, letterSpacing: 1 }}
+              >
+                + ADD TO SLIP
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────
+export default function BetScoutPro() {
+  const [tab, setTab] = useState("scout");
+  const [sport, setSport] = useState("All Sports");
+  const [league, setLeague] = useState("All Leagues");
+  const [tolerance, setTolerance] = useState(3);
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
+  const [picks, setPicks] = useState([]);
+  const [slip, setSlip] = useState([]);
+  const [researching, setResearching] = useState(null);
+  const [error, setError] = useState("");
+  const [stake, setStake] = useState(1000);
+
+  const scoutStatuses = [
+    "Scanning tipster sites...",
+    "Searching Twitter predictions...",
+    "Checking Reddit r/SoccerBetting...",
+    "Crawling sports forums...",
+    "Cross-referencing odds...",
+    "Filtering by your tolerance...",
+    "Building intelligence report...",
+  ];
+
+  async function scout() {
+    setLoading(true);
+    setPicks([]);
+    setError("");
+    let si = 0;
+    setStatus(scoutStatuses[0]);
+    const iv = setInterval(() => {
+      si = (si + 1) % scoutStatuses.length;
+      setStatus(scoutStatuses[si]);
+    }, 2200);
+
+    const toleranceDesc = {
+      1: "Only the safest favourites, single outcomes only",
+      2: "Conservative — strong favourites, team to win or BTTS",
+      3: "Balanced — good value bets, avoid big upsets",
+      4: "Aggressive — higher risk picks with good evidence",
+      5: "High risk — value bets including unlikely outcomes",
+    }[tolerance];
+
+    try {
+      const raw = await callAI(
+        SCOUT_SYSTEM,
+        `Today's date: ${new Date().toLocaleDateString("en-ZA", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}. Scout betting predictions for: Sport: ${sport}, League: ${league}. User risk tolerance: ${toleranceDesc}. Max odds per pick: 2.5. Search multiple sources and return 6-10 quality picks.`,
+        true
+      );
+      clearInterval(iv);
+      const data = parseJSON(raw);
+      const valid = data.filter(p => p.odds && p.odds <= 2.5);
+      setPicks(valid);
+      setStatus(`✅ Scouted ${valid.length} picks with odds ≤ 2.5 from the web`);
+    } catch (e) {
+      clearInterval(iv);
+      setError("Scouting failed: " + e.message);
+      setStatus("");
+    }
+    setLoading(false);
+  }
+
+  function addToSlip(pick) {
+    if (!slip.find(s => s.id === pick.id)) setSlip(prev => [...prev, pick]);
+  }
+
+  function removeFromSlip(id) {
+    setSlip(prev => prev.filter(p => p.id !== id));
+  }
+
+  const inSlipIds = new Set(slip.map(p => p.id));
+
+  return (
+    <>
+      <style>{G}</style>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+      `}</style>
+
+      {researching && <ResearchModal pick={researching} onClose={() => setResearching(null)} key={researching.id} />}
+
+      <div style={{ maxWidth: 860, margin: "0 auto", padding: "20px 14px" }}>
+
+        {/* HEADER */}
+        <div style={{ marginBottom: 28, borderBottom: "1px solid var(--wire)", paddingBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 8 }}>
+            <div style={{
+              width: 48, height: 48, background: "var(--gold)", display: "flex", alignItems: "center",
+              justifyContent: "center", fontFamily: "var(--font-head)", fontSize: 22, color: "#060a0f", letterSpacing: 2,
+            }}>BS</div>
+            <div>
+              <div style={{ fontFamily: "var(--font-head)", fontSize: 36, letterSpacing: 3, color: "var(--gold)", lineHeight: 1 }}>
+                BET SCOUT PRO
+              </div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 3 }}>
+                AI Intelligence · Live Web Scraping · Max 2.5 Odds
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* CONTROLS */}
+        <div style={{ background: "var(--ink2)", border: "1px solid var(--wire2)", padding: 16, marginBottom: 20 }}>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+            <div style={{ flex: 1, minWidth: 150 }}>
+              <Label>Sport</Label>
+              <select value={sport} onChange={e => setSport(e.target.value)} style={selectStyle}>
+                {SPORTS.map(s => <option key={s}>{s}</option>)}
+              </select>
+            </div>
+            <div style={{ flex: 1, minWidth: 150 }}>
+              <Label>League</Label>
+              <select value={league} onChange={e => setLeague(e.target.value)} style={selectStyle}>
+                {LEAGUES.map(l => <option key={l}>{l}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <Label>Risk Tolerance: <span style={{ color: "var(--gold)" }}>{TOLERANCE_LABELS[tolerance]}</span></Label>
+            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+              {[1, 2, 3, 4, 5].map(v => (
+                <button key={v} onClick={() => setTolerance(v)} style={{
+                  flex: 1, padding: "8px 4px",
+                  background: tolerance === v ? "var(--gold)" : "var(--ink3)",
+                  border: `1px solid ${tolerance === v ? "var(--gold)" : "var(--wire2)"}`,
+                  color: tolerance === v ? "#060a0f" : "var(--text3)",
+                  fontFamily: "var(--font-head)", fontSize: 16, letterSpacing: 1,
+                }}>
+                  {v}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", marginTop: 4 }}>
+              <span>Safe</span><span>High Risk</span>
+            </div>
+          </div>
+
+          <button onClick={scout} disabled={loading} style={{
+            width: "100%", background: loading ? "var(--wire2)" : "var(--gold)",
+            color: loading ? "var(--text3)" : "#060a0f", border: "none",
+            padding: "14px 0", fontFamily: "var(--font-head)", fontSize: 20, letterSpacing: 3,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 12,
+          }}>
+            {loading ? <><Spinner size={18} /> SCOUTING THE WEB...</> : "🔍 SCOUT PREDICTIONS"}
+          </button>
+        </div>
+
+        {/* STATUS */}
+        {(loading || status) && !error && (
+          <div style={{ display: "flex", gap: 10, alignItems: "center", padding: "10px 14px", background: "var(--ink2)", border: "1px solid var(--wire2)", marginBottom: 16, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--gold)" }}>
+            {loading && <Spinner />}
+            {!loading && <span style={{ color: "var(--lime)" }}>●</span>}
+            {status}
+          </div>
+        )}
+        {error && (
+          <div style={{ padding: "10px 14px", background: "var(--red2)", border: "1px solid var(--red)", marginBottom: 16, fontFamily: "var(--font-mono)", fontSize: 12, color: "#fca5a5" }}>
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* TABS */}
+        {(picks.length > 0 || tab === "upload") && (
+          <div style={{ display: "flex", borderBottom: "1px solid var(--wire)", marginBottom: 20, gap: 0 }}>
+            {[["scout", `🔎 Scouted (${picks.length})`], ["slip", `🎫 Slip (${slip.length})`], ["upload", "📸 Upload"]].map(([key, label]) => (
+              <button key={key} onClick={() => setTab(key)} style={{
+                padding: "10px 18px", background: "none", border: "none",
+                borderBottom: `2px solid ${tab === key ? "var(--gold)" : "transparent"}`,
+                color: tab === key ? "var(--gold)" : "var(--text3)",
+                fontFamily: "var(--font-mono)", fontSize: 12, textTransform: "uppercase", letterSpacing: 1,
+                marginBottom: -1,
+              }}>{label}</button>
+            ))}
+          </div>
+        )}
+
+        {/* UPLOAD TAB always accessible */}
+        {tab === "upload" && (
+          <UploadPanel tolerance={tolerance} onAddPick={p => { addToSlip(p); setTab("slip"); }} />
+        )}
+
+        {/* SCOUTED PICKS */}
+        {tab === "scout" && picks.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {picks.map((p, i) => (
+              <div key={p.id || i} style={{ position: "relative" }}>
+                <PickCard pick={p} index={i} onResearch={setResearching} inSlip={inSlipIds.has(p.id)} />
+                {!inSlipIds.has(p.id) && (
+                  <button
+                    onClick={() => addToSlip(p)}
+                    style={{
+                      position: "absolute", bottom: 14, right: 14,
+                      background: "var(--gold)", color: "#060a0f", border: "none",
+                      padding: "5px 12px", fontFamily: "var(--font-head)", fontSize: 13, letterSpacing: 1,
+                      zIndex: 2,
+                    }}
+                    onClick={e => { e.stopPropagation(); addToSlip(p); }}
+                  >+ ADD TO SLIP</button>
+                )}
+                {inSlipIds.has(p.id) && (
+                  <div style={{ position: "absolute", bottom: 14, right: 14, fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--lime)", background: "var(--lime2)", padding: "5px 10px", border: "1px solid var(--lime)" }}>
+                    ✓ IN SLIP
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* SLIP TAB */}
+        {tab === "slip" && (
+          slip.length === 0
+            ? <div style={{ textAlign: "center", padding: "48px 20px", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 13 }}>
+                No picks in slip yet. Scout predictions or upload screenshots.
+              </div>
+            : <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {slip.map((p, i) => (
+                  <PickCard key={p.id} pick={p} index={i} onResearch={setResearching} onRemove={removeFromSlip} inSlip />
+                ))}
+              </div>
+        )}
+
+        {/* ALWAYS SHOW BET SLIP SUMMARY AT BOTTOM */}
+        {slip.length > 0 && (
+          <BetSlip picks={slip} onResearch={setResearching} onRemove={removeFromSlip} stake={stake} onStakeChange={setStake} />
+        )}
+
+        {/* UPLOAD TAB ALWAYS ACCESSIBLE WHEN NO PICKS */}
+        {picks.length === 0 && tab !== "upload" && (
+          <div style={{ textAlign: "center", padding: "32px 20px", color: "var(--text3)" }}>
+            <div style={{ fontFamily: "var(--font-head)", fontSize: 22, letterSpacing: 2, color: "var(--wire2)", marginBottom: 12 }}>
+              READY TO SCOUT
+            </div>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, marginBottom: 20 }}>
+              Set your filters above and hit Scout, or<br />upload screenshots from social media below.
+            </div>
+            <button onClick={() => setTab("upload")} style={{
+              background: "none", border: "1px solid var(--wire2)", color: "var(--text3)",
+              padding: "10px 20px", fontFamily: "var(--font-head)", fontSize: 15, letterSpacing: 2,
+            }}>📸 UPLOAD SCREENSHOTS</button>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+const selectStyle = {
+  width: "100%", background: "var(--ink)", border: "1px solid var(--wire2)", color: "var(--text)",
+  padding: "8px 12px", fontSize: 13, marginTop: 4, outline: "none",
+};
+
+function Label({ children }) {
+  return <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1 }}>{children}</div>;
+}
